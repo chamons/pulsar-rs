@@ -1314,4 +1314,102 @@ mod tests {
 
         join_handle.await.unwrap();
     }
+
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn consumer_rebalance() {
+        let _result = log::set_logger(&MULTI_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+
+        let addr = "pulsar://127.0.0.1:6650";
+
+        let topic_n: u16 = rand::random();
+        let topic = format!("consumer_{topic_n}");
+
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+
+        // Send a single message
+        let data1 = TestData {
+            topic: "a".to_owned(),
+            msg: 1,
+        };
+
+        client.send(&topic, &data1).await.unwrap();
+
+        let builder = client
+            .consumer()
+            .with_subscription_type(SubType::Shared)
+            // get earliest messages
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                ..Default::default()
+            });
+
+        let mut consumer: Consumer<TestData, _> = builder
+            .clone()
+            .with_subscription("consumer_1")
+            .with_consumer_name("consumer_1")
+            .with_topics([&topic])
+            .with_subscription_type(SubType::Shared)
+            .build()
+            .await
+            .unwrap();
+
+        // And consume that message
+        let msg = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT)
+            .await
+            .expect("timed out waiting for first message");
+
+        assert_eq!(data1, msg.deserialize().unwrap());
+        consumer.ack(&msg).await.unwrap();
+
+        // Now for a topic unload
+        // https://pulsar.apache.org/admin/v2/persistent/{tenant}/{namespace}/{topic}/unload
+
+        let create_partitioned_topic_url =
+            format!("http://127.0.0.1:8080/admin/v2/persistent/public/default/{topic}/unload");
+
+        let http_client = reqwest::Client::new();
+        let response = http_client
+            .put(create_partitioned_topic_url)
+            .send()
+            .await
+            .unwrap();
+
+        println!("{response:?}");
+        assert!(response.status().is_success());
+
+        // Given the rebalance time to take effect
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Send a second message
+        let data2 = TestData {
+            topic: "b".to_owned(),
+            msg: 2,
+        };
+        client.send(&topic, &data2).await.unwrap();
+
+        // We should be able to consume that second message as well
+
+        loop {
+            let msg = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT * 2)
+                .await
+                .expect("timed out waiting for second message");
+
+            // We can see a replay of the previous message
+            let data = msg.deserialize().unwrap();
+            if data == data1 {
+                println!("Message replayed");
+                continue;
+            } else {
+                assert_eq!(data2, data);
+                consumer.ack(&msg).await.unwrap();
+                break;
+            }
+        }
+    }
 }
